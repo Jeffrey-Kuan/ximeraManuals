@@ -329,3 +329,7 @@ xmDevEnvFiles.tgz
 
 
 *.failed
+# tex4npm build (npm toolchain)
+node_modules/
+dist/
+.tex4npm/

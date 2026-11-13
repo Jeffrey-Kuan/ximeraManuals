@@ -1,0 +1,122 @@
+# Build the Ximera site with tex4npm, and publish dist/ to S3 if a bucket is set.
+#
+# This replaces the earlier serve-ximera.yml, which built with xake and
+# published to a Ximera server. The .tex files are unchanged and stay where
+# they are; tex4npm.config.js points the build at the repository root.
+#
+# Every push and pull request builds the site. Deploying is optional: it only
+# happens on pushes to the default branch, and only when the S3_BUCKET variable
+# exists. Set these under Settings > Secrets and variables > Actions:
+#
+#   Secrets:   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   Variables: S3_BUCKET     the bucket name
+#              AWS_REGION    the bucket's region, e.g. us-east-2
+#              S3_PREFIX     optional folder inside the bucket, e.g. ximera-manuals
+
+name: Build and deploy
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Full TeX Live, Debian based. Includes pdflatex, latex, tex4ht, t4ht,
+    # dvisvgm and the CTAN packages activities are likely to load.
+    container:
+      image: texlive/texlive:latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # Workaround for @ximera/answer 2.0.0. Its post-processing step turns
+      # \answer{...} inside display math into an input box, but only looks for
+      # <div class="mathjax-block">. Current TeX4ht writes display math as
+      # <span class="mathjax-block">, so those answers were left as a literal
+      # \answer, which MathJax shows in red. Remove this step once the package
+      # handles both. The grep makes the build fail loudly if the package
+      # changes and the patch no longer applies.
+      - name: Patch answer post-processing for span display math
+        run: |
+          f=node_modules/@ximera/answer/postprocess.js
+          sed -i "s/'span.mathjax-inline, div.mathjax-block'/'span.mathjax-inline, div.mathjax-block, span.mathjax-block'/" "$f"
+          grep -q "div.mathjax-block, span.mathjax-block" "$f"
+
+      # Workaround for tex4npm 2.0.0. For the copy of each activity inside a
+      # course folder, it copies the page's images next to the copy, and then
+      # also adds "../" to every <img src>, so the link points one folder too
+      # high and photos show as broken. Remove the "../" rewrite for images.
+      # Remove this step once tex4npm is fixed.
+      - name: Patch image links in course copies
+        run: |
+          f=node_modules/tex4npm/src/xourse.js
+          sed -i "/\$('img\[src\]').each((_, el) => rewrite(el, 'src'));/d" "$f"
+          if grep -q "img\[src\]').each((_, el) => rewrite" "$f"; then echo "image-link patch did not apply"; exit 1; fi
+
+      # The web build cannot read the size of a PNG or JPG by itself. Without
+      # a .xbb file next to the picture it assumes the picture is square, which
+      # distorts it. Create the missing .xbb files; ones committed to the
+      # repository are left alone.
+      - name: Create size files for pictures
+        run: |
+          find . -path ./node_modules -prune -o -path ./.git -prune -o -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) -print | while read -r f; do
+            [ -f "${f%.*}.xbb" ] || (cd "$(dirname "$f")" && extractbb "$(basename "$f")")
+          done
+          echo "size files present: $(find . -path ./node_modules -prune -o -name '*.xbb' -print | wc -l)"
+
+      - name: Build site
+        run: npm run build
+
+      - name: Sanity check
+        run: |
+          test -s dist/ximera.js
+          test -s dist/ximera.css
+          echo "HTML pages built: $(find dist -name '*.html' | wc -l)"
+
+      # Report only, never fails the build: a literal \answer can be legitimate,
+      # for example inside a verbatim listing.
+      - name: Report answer boxes left unconverted
+        run: |
+          grep -rl --include='*.html' '\\answer' dist > /tmp/unconverted.txt || true
+          echo "HTML pages still containing a literal \\answer: $(wc -l < /tmp/unconverted.txt)"
+          head -20 /tmp/unconverted.txt
+
+      - name: Configure AWS credentials
+        if: vars.S3_BUCKET != '' && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # --delete removes objects that are no longer part of the site. With a
+      # prefix it only looks inside that folder; without one it covers the
+      # whole bucket, so never point a prefix-less deploy at a shared bucket.
+      - name: Deploy to S3
+        if: vars.S3_BUCKET != '' && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          S3_PREFIX: ${{ vars.S3_PREFIX }}
+        run: |
+          if [ -n "$S3_PREFIX" ]; then
+            npx tex4npm deploy "$S3_BUCKET" --prefix "$S3_PREFIX" --delete
+          else
+            npx tex4npm deploy "$S3_BUCKET" --delete
+          fi
